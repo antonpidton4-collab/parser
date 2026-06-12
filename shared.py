@@ -1,0 +1,1512 @@
+import logging
+import os
+import re
+import time
+import asyncio
+import concurrent.futures
+import contextvars
+import copy
+import hashlib
+import json
+import threading
+import unicodedata
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from collections.abc import MutableMapping
+
+import requests
+
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+PROXY_URL = os.environ.get("PROXY_URL", "")
+
+VINTED_REGIONS = {
+    "at": "www.vinted.at",
+    "be": "www.vinted.be",
+    "com": "www.vinted.com",
+    "co.uk": "www.vinted.co.uk",
+    "cz": "www.vinted.cz",
+    "de": "www.vinted.de",
+    "dk": "www.vinted.dk",
+    "ee": "www.vinted.ee",
+    "es": "www.vinted.es",
+    "fi": "www.vinted.fi",
+    "fr": "www.vinted.fr",
+    "gr": "www.vinted.gr",
+    "hr": "www.vinted.hr",
+    "hu": "www.vinted.hu",
+    "ie": "www.vinted.ie",
+    "it": "www.vinted.it",
+    "pl": "www.vinted.pl",
+    "lt": "www.vinted.lt",
+    "lu": "www.vinted.lu",
+    "lv": "www.vinted.lv",
+    "nl": "www.vinted.nl",
+    "pt": "www.vinted.pt",
+    "ro": "www.vinted.ro",
+    "se": "www.vinted.se",
+    "si": "www.vinted.si",
+    "sk": "www.vinted.sk",
+}
+DEFAULT_VINTED_REGION_CODES = set(VINTED_REGIONS)
+CATALOG_IDS = [1, 3, 5, 9, 7, 12]
+MAX_AGE_HOURS = 24
+
+try:
+    MERCARI_MIN_MARKET_SAMPLES = max(1, int(os.environ.get("MERCARI_MIN_MARKET_SAMPLES", "1")))
+except ValueError:
+    MERCARI_MIN_MARKET_SAMPLES = 1
+
+try:
+    MERCARI_MAX_MARKET_RATIO = float(os.environ.get("MERCARI_MAX_MARKET_RATIO", "1.00"))
+except ValueError:
+    MERCARI_MAX_MARKET_RATIO = 1.00
+
+BAD_WORDS = [
+    "pieluchy", "pampers", "baby", "dziecko", "dla dzieci", "подгузники", "детское",
+    "nosidelko", "fotelik", "wozek", "kocyk", "smoczek", "lozeczko",
+    "underwear", "socks", "bielizna", "majtki", "skarpety", "rajstopy",
+    "biustonosz", "bokserki", "stringi", "figi",
+    "kask", "rower", "hulajnoga", "rolki", "narty", "deska",
+    "telefon", "laptop", "tablet", "konsola",
+    "perfumy", "krem", "szampon",
+    "ksiazka", "zabawka", "puzzle", "klocki",
+    "posciel", "poduszka", "koldra", "recznik", "zaslona",
+]
+
+DEEP_FASHION_BLOCKED_WORDS = [
+    "ceiling light", "lighting fixture", "chandelier", "lamp", "table lamp",
+    "floor lamp", "hdd", "ssd", "hard drive", "external drive", "duplicator",
+    "usb", "software", "adapter", "docking station",
+    "\u30b7\u30fc\u30ea\u30f3\u30b0\u30e9\u30a4\u30c8", "\u7167\u660e", "\u30e9\u30f3\u30d7",
+    "\u5929\u4e95\u7167\u660e", "\u30cf\u30fc\u30c9\u30c7\u30a3\u30b9\u30af",
+    "\u30c7\u30e5\u30d7\u30ea\u30b1\u30fc\u30bf\u30fc", "\u30bd\u30d5\u30c8\u30a6\u30a7\u30a2",
+    "\u30c9\u30c3\u30ad\u30f3\u30b0\u30b9\u30c6\u30fc\u30b7\u30e7\u30f3",
+    "novelty", "ノベルティ", "sample", "gift", "promo", "limited gift", "付録",
+    "mirror", "ミラー", "鏡", "basket", "バスケット", "籠", "かご",
+    "cosmetic", "makeup", "perfume", "perfumes", "fragrance", "cologne",
+    "parfum", "eau de toilette", "eau de parfum", "edt", "edp",
+    "aroma", "aromat", "духи", "парфюм", "аромат",
+    "化粧", "メイク", "ポーチのみ", "case only",
+    "tableware", "plate", "cup", "mug", "bottle", "glass", "皿", "カップ", "マグ",
+    "interior", "home", "room", "blanket", "pillow", "towel", "rug",
+    "キッチン", "インテリア", "タオル", "ブランケット", "クッション",
+    "baby", "kids", "child", "children", "ベビー", "キッズ", "子供",
+]
+
+UNWANTED_ITEM_TERMS = [
+    "loafer", "loafers", "penny loafer", "penny loafers", "sport loafer", "sport loafers",
+    "derby shoe", "derby shoes", "derby boot", "derby boots", "lace-up derby", "dress derby",
+    "derbies", "dress shoes", "formal shoes", "oxford shoes",
+    "monk strap", "monk-strap", "brogue", "brogues", "moccasin", "moccasins", "mocassin", "mocassins",
+    "cima",
+    "pump shoes", "pumps", "high heels", "stiletto", "stilettos",
+    "sandal", "sandals", "flat shoes", "ballet flats", "ballerina", "mules",
+    "wallet", "wallets", "cardholder", "card holder", "card case", "coin purse", "billfold",
+    "money clip", "small leather goods", "fold wallet", "bifold", "trifold",
+    "glasses", "sunglasses", "eyeglasses", "eyewear", "optical", "eyeglass frames", "spectacle frames",
+    "blouse", "blouses",
+    "туфли", "лоферы", "лофер", "мокасины", "мокасин", "дерби", "оксфорды", "каблуки", "босоножки",
+    "сандалии", "балетки", "кошелек", "кошелёк", "портмоне", "кардхолдер", "визитница",
+    "очки", "солнцезащитные очки", "блузка", "блуза",
+    "mokasyny", "mokasyn", "mokasiny", "mokasin", "lofery", "pantofle", "czolenka", "czółenka",
+    "portfel", "portfele", "portmonetka", "etui na karty", "wizytownik",
+    "szpilki", "obcasy", "sandaly", "sandały", "okulary", "bluzka",
+    "ローファー", "モカシン", "ダービー", "革靴", "オックスフォード", "パンプス", "ヒール",
+    "サンダル", "バレエシューズ", "メガネ", "眼鏡", "サングラス", "ブラウス",
+    "財布", "ウォレット", "カードケース", "カードホルダー", "コインケース", "小銭入れ", "札入れ", "二つ折り財布", "三つ折り財布",
+    "로퍼", "모카신", "더비", "구두", "옥스포드", "펌프스", "힐", "샌들", "플랫슈즈",
+    "지갑", "반지갑", "장지갑", "카드지갑", "카드 홀더", "카드홀더", "동전지갑", "머니클립",
+    "안경", "선글라스", "블라우스",
+]
+
+DEEP_FASHION_SIZE_PATTERN = re.compile(
+    r"(?<![a-z0-9])("
+    r"xxs|xs|s|m|l|xl|xxl|xxxl|"
+    r"it\s?\d{2}|eu\s?\d{2}|jp\s?\d{1,2}|us\s?\d{1,2}|"
+    r"\d{2}(?:\.\d)?\s?cm"
+    r")(?![a-z0-9])",
+    re.IGNORECASE,
+)
+
+COMMON_FASHION_KIND_GROUPS = [
+    ("shoes", [
+        "sneaker", "sneakers", "shoe", "shoes", "trainer", "trainers", "runner", "runners",
+        "boot", "boots", "loafer", "loafers", "derby", "derbies", "oxford", "oxfords",
+        "sandal", "sandals", "slides", "mules", "heels", "pumps", "tabi", "qasa",
+        "kaiwa", "terrex", "ozweego", "ramones", "geobasket", "dunks", "replica sneakers",
+        "replica shoes", "\u30b9\u30cb\u30fc\u30ab\u30fc", "\u30b7\u30e5\u30fc\u30ba",
+        "\u9774", "\u30d6\u30fc\u30c4", "\u30ed\u30fc\u30d5\u30a1\u30fc",
+        "\u30b5\u30f3\u30c0\u30eb", "\u30c0\u30fc\u30d3\u30fc",
+        "\uc6b4\ub3d9\ud654", "\uc2a4\ub2c8\ucee4\uc988", "\ubd80\uce20",
+        "\ub85c\ud37c", "\uc0cc\ub4e4", "\u043a\u0440\u043e\u0441\u0441\u043e\u0432\u043a\u0438",
+        "\u0431\u043e\u0442\u0438\u043d\u043a\u0438", "\u0442\u0443\u0444\u043b\u0438",
+    ]),
+    ("bag", [
+        "bag", "bags", "backpack", "rucksack", "wallet", "cardholder", "card holder",
+        "shoulder bag", "tote", "pouch", "duffle", "messenger bag", "crossbody",
+        "\u30d0\u30c3\u30b0", "\u30ea\u30e5\u30c3\u30af", "\u8ca1\u5e03",
+        "\u30c8\u30fc\u30c8", "\u30dd\u30fc\u30c1", "\uac00\ubc29", "\ubc31\ud329",
+        "\uc9c0\uac11", "\ud1a0\ud2b8\ubc31", "\u0441\u0443\u043c\u043a\u0430",
+        "\u0440\u044e\u043a\u0437\u0430\u043a", "\u043a\u043e\u0448\u0435\u043b\u0435\u043a",
+    ]),
+    ("tops", [
+        "shirt", "t-shirt", "t shirt", "tee", "hoodie", "sweatshirt", "sweat",
+        "sweater", "knit", "cardigan", "polo", "top", "blouse", "long sleeve",
+        "ls tee", "cutsew", "cut sew", "tank top", "camisole", "vest top",
+        "\u30b7\u30e3\u30c4", "t\u30b7\u30e3\u30c4", "\u30d1\u30fc\u30ab\u30fc",
+        "\u30cb\u30c3\u30c8", "\u30ab\u30fc\u30c7\u30a3\u30ac\u30f3",
+        "\u30d6\u30e9\u30a6\u30b9", "\u30c8\u30c3\u30d7\u30b9",
+        "\uc154\uce20", "\ud2f0\uc154\uce20", "\ud6c4\ub4dc", "\ub2c8\ud2b8",
+        "\uac00\ub514\uac74", "\ube14\ub77c\uc6b0\uc2a4", "\u0444\u0443\u0442\u0431\u043e\u043b\u043a\u0430",
+        "\u0445\u0443\u0434\u0438", "\u0440\u0443\u0431\u0430\u0448\u043a\u0430",
+        "\u0441\u0432\u0438\u0442\u0435\u0440", "\u043a\u0430\u0440\u0434\u0438\u0433\u0430\u043d",
+    ]),
+    ("outerwear", [
+        "jacket", "coat", "blouson", "vest", "parka", "down jacket", "puffer",
+        "windbreaker", "bomber", "track jacket", "track top", "tracksuit",
+        "blazer", "anorak", "\u30b8\u30e3\u30b1\u30c3\u30c8", "\u30b3\u30fc\u30c8",
+        "\u30d6\u30eb\u30be\u30f3", "\u30d9\u30b9\u30c8", "\u30c0\u30a6\u30f3",
+        "\uc790\ucf13", "\uc7ac\ud0b7", "\ucf54\ud2b8", "\ud328\ub529",
+        "\ubd04\ubc84", "\u043a\u0443\u0440\u0442\u043a\u0430", "\u043f\u0430\u043b\u044c\u0442\u043e",
+        "\u0436\u0438\u043b\u0435\u0442", "\u043f\u0443\u0445\u043e\u0432\u0438\u043a",
+    ]),
+    ("bottoms", [
+        "pants", "jeans", "denim", "trousers", "shorts", "skirt", "cargo",
+        "slacks", "leggings", "joggers", "sweatpants", "track pants",
+        "\u30d1\u30f3\u30c4", "\u30c7\u30cb\u30e0", "\u30b8\u30fc\u30f3\u30ba",
+        "\u30b7\u30e7\u30fc\u30c4", "\u30b9\u30ab\u30fc\u30c8",
+        "\ubc14\uc9c0", "\ud32c\uce20", "\uccad\ubc14\uc9c0", "\ub370\ub2d8",
+        "\uc1fc\uce20", "\uc2a4\ucee4\ud2b8", "\ub808\uae45\uc2a4",
+        "\u0434\u0436\u0438\u043d\u0441\u044b", "\u0448\u0442\u0430\u043d\u044b",
+        "\u0431\u0440\u044e\u043a\u0438", "\u0448\u043e\u0440\u0442\u044b", "\u044e\u0431\u043a\u0430",
+    ]),
+    ("dress", [
+        "dress", "one piece", "one-piece", "tunic", "\u30ef\u30f3\u30d4\u30fc\u30b9",
+        "\u30c9\u30ec\u30b9", "\uc6d0\ud53c\uc2a4", "\ud29c\ub2c9",
+        "\u043f\u043b\u0430\u0442\u044c\u0435",
+    ]),
+    ("accessory", [
+        "cap", "hat", "beanie", "belt", "scarf", "gloves", "sunglasses", "glasses",
+        "eyewear", "tie", "brooch", "pin", "watch cap", "\u5e3d\u5b50",
+        "\u30ad\u30e3\u30c3\u30d7", "\u30cf\u30c3\u30c8", "\u30d9\u30eb\u30c8",
+        "\u30de\u30d5\u30e9\u30fc", "\u30b5\u30f3\u30b0\u30e9\u30b9",
+        "\ubaa8\uc790", "\ucea1", "\ube44\ub2c8", "\ubca8\ud2b8",
+        "\uba38\ud50c\ub7ec", "\u043a\u0435\u043f\u043a\u0430", "\u0448\u0430\u043f\u043a\u0430",
+        "\u0440\u0435\u043c\u0435\u043d\u044c", "\u0448\u0430\u0440\u0444", "\u043e\u0447\u043a\u0438",
+    ]),
+]
+COMMON_FASHION_KIND_WORDS = [word for _, words in COMMON_FASHION_KIND_GROUPS for word in words]
+
+NON_FASHION_NOISE_TERMS = [
+    "ceiling light", "lighting fixture", "chandelier", "lamp", "table lamp",
+    "floor lamp", "light bulb", "led light", "interior light", "wall light",
+    "hdd", "ssd", "hard drive", "external drive", "duplicator", "docking station",
+    "usb", "software", "adapter", "charger", "cable", "battery", "power supply",
+    "phone", "iphone", "android", "smartphone", "tablet", "laptop", "computer",
+    "keyboard", "mouse", "monitor", "printer", "router", "camera", "lens",
+    "game console", "controller", "speaker", "microphone", "audio interface",
+    "perfume", "fragrance", "cologne", "makeup", "cosmetic", "shampoo", "cream",
+    "toy", "figure", "doll", "plush", "book", "magazine", "dvd", "blu-ray",
+    "cd", "record", "vinyl", "poster", "sticker", "keychain", "trading card",
+    "tableware", "plate", "cup", "mug", "glass", "bottle", "rug", "blanket",
+    "pillow", "towel", "curtain", "bed sheet", "sofa", "chair", "desk", "shelf",
+    "guitar", "bass guitar", "drum", "piano", "keyboard piano", "violin", "flute",
+    "trumpet", "saxophone", "instrument", "musical instrument",
+    "\u30b7\u30fc\u30ea\u30f3\u30b0\u30e9\u30a4\u30c8", "\u7167\u660e", "\u30e9\u30f3\u30d7",
+    "\u30cf\u30fc\u30c9\u30c7\u30a3\u30b9\u30af", "\u30c7\u30e5\u30d7\u30ea\u30b1\u30fc\u30bf\u30fc",
+    "\u30bd\u30d5\u30c8\u30a6\u30a7\u30a2", "\u30b9\u30de\u30db", "\u30ab\u30e1\u30e9",
+    "\u9999\u6c34", "\u30d5\u30a3\u30ae\u30e5\u30a2", "\u672c", "\u96d1\u8a8c",
+    "\u30dd\u30b9\u30bf\u30fc", "\u30b9\u30c6\u30c3\u30ab\u30fc", "\u30ad\u30fc\u30db\u30eb\u30c0\u30fc",
+    "\u30ae\u30bf\u30fc", "\u697d\u5668", "\uc870\uba85", "\ud558\ub4dc\ub514\uc2a4\ud06c",
+    "\uc18c\ud504\ud2b8\uc6e8\uc5b4", "\uce74\uba54\ub77c", "\ud5a5\uc218",
+    "\ud53c\uaddc\uc5b4", "\uc7a5\ub09c\uac10", "\ucc45", "\uae30\ud0c0",
+    "\uc545\uae30",
+]
+
+COUNTERFEIT_NOISE_TERMS = [
+    "fake", "counterfeit", "unauthentic", "not authentic", "bootleg", "copy",
+    "knockoff", "knock-off", "dupe", "replica item", "replica bag", "replica watch",
+    "\u5047\u7269", "\u30b3\u30d4\u30fc", "\u30d5\u30a7\u30a4\u30af",
+    "\uac00\ud488", "\ub808\ud50c\ub9ac\uce74", "\u043f\u043e\u0434\u0434\u0435\u043b\u043a\u0430",
+    "\u043a\u043e\u043f\u0438\u044f",
+]
+
+COUNTERFEIT_SAFE_MODEL_TERMS = [
+    "maison margiela replica", "margiela replica", "replica sneakers",
+    "replica sneaker", "replica shoes", "replica shoe", "replica gats",
+]
+
+ALL_BRANDS = [
+    "stone island", "balenciaga", "raf simons", "bape", "aape",
+    "gucci", "chanel", "jeremy scott", "undercover", "comme des garcons",
+    "yohji yamamoto", "vetements", "palm angels", "maison margiela",
+    "givenchy", "burberry", "supreme", "amiri", "acne studios", "alyx",
+    "tornado mart", "14th addiction", "project g/r", "hysteric glamour",
+    "dolce&gabbana", "number nine", "grailz project", "y-3", "lgb",
+    "ed hardy", "mcm", "true religion", "guiseppe zanotti", "arcteryx",
+    "rick owens", "evisu", "saint laurent", "neighborhood", "prada",
+    "dior", "jaded london", "diesel", "alpha industries", "glory boyz",
+    "ralph lauren", "louis vuitton", "phillipp plein", "versace",
+    "rock revival", "mastermind", "alexander mqueen",
+    "cav empt", "buffalo bobs", "billionaire boys club", "acronym",
+    "swear", "vivienne westwood", "balmain", "issey miyake",
+    "if six was nine", "20471120", "cp company", "laoboutin",
+    "robin jeans", "гоша рубчинский", "ferragamo", "salem",
+    "marcelo burlon", "erd", "chrome hearts", "isabel marant",
+    "mihara yasuhiro", "carol cristian poell", "alice hollywood",
+    "moncler", "valentino", "helmut lang",
+    "maison martin margiela", "dsquared2",
+]
+
+BRAND_ALIASES = {
+    "stone island": ["stoneisland", "stone isl", "ストーンアイランド"],
+    "balenciaga": ["バレンシアガ", "발렌시아가"],
+    "raf simons": ["rafsimons", "ラフシモンズ"],
+    "bape": ["a bathing ape", "abathingape", "エイプ", "베이프"],
+    "aape": ["aape by a bathing ape"],
+    "gucci": ["グッチ", "구찌"],
+    "chanel": ["シャネル", "샤넬"],
+    "jeremy scott": ["jeremyscott"],
+    "undercover": ["under cover", "undercoverism", "アンダーカバー", "アンダーカバーイズム", "\uc5b8\ub354\ucee4\ubc84"],
+    "comme des garcons": ["comme des garçons", "comme des garcon", "cdg", "コムデギャルソン", "꼼데가르송"],
+    "yohji yamamoto": [
+        "yohji", "yohji yamamoto pour homme", "y's", "ys", "yohji y's",
+        "s'yte", "syte", "wildside", "wild side",
+        "ヨウジヤマモト", "\uc694\uc9c0 \uc57c\ub9c8\ubaa8\ud1a0", "\uc694\uc9c0\uc57c\ub9c8\ubaa8\ud1a0",
+        "\uc640\uc774\uc988", "\uc640\uc77c\ub4dc\uc0ac\uc774\ub4dc", "\uc640\uc77c\ub4dc \uc0ac\uc774\ub4dc",
+    ],
+    "vetements": ["vetement", "vtmnts", "ヴェトモン", "베트멍"],
+    "palm angels": ["palmangels"],
+    "maison margiela": ["margiela", "maison martin margiela", "martin margiela", "마르지엘라"],
+    "givenchy": ["ジバンシィ", "ジバンシー"],
+    "burberry": ["バーバリー", "버버리"],
+    "supreme": ["シュプリーム", "슈프림"],
+    "amiri": ["アミリ", "아미리"],
+    "acne studios": ["acne", "アクネ", "아크네"],
+    "alyx": ["1017 alyx 9sm", "alyx studio"],
+    "tornado mart": ["tornadomart", "トルネードマート"],
+    "14th addiction": ["fourteenth addiction", "14thaddiction"],
+    "project g/r": ["project gr", "project g r", "projectgr", "grailz", "grailz project", "grailzproject", "グレイルズ", "그레일즈"],
+    "hysteric glamour": ["hysterics", "hysteric", "ヒステリックグラマー"],
+    "dolce&gabbana": ["dolce gabbana", "dolce and gabbana", "d&g", "ドルチェ&ガッバーナ"],
+    "number nine": ["number (n)ine", "number n ine", "numbernine", "ナンバーナイン"],
+    "grailz project": ["grailz", "grailzproject", "project g/r", "project gr", "projectgr", "project g r", "projtct", "グレイルズ", "그레일즈"],
+    "y-3": ["y3", "yohji adidas", "ワイスリー", "\uc640\uc774\uc4f0\ub9ac", "\uc640\uc774\uc2a4\ub9ac"],
+    "lgb": ["le grand bleu", "ルグランブルー"],
+    "ed hardy": ["edhardy"],
+    "true religion": ["truereligion", "トゥルーレリジョン"],
+    "guiseppe zanotti": ["giuseppe zanotti", "giuseppezanotti", "zanotti", "ジュゼッペザノッティ"],
+    "arcteryx": ["arc'teryx", "arc teryx", "arc-teryx", "veilance", "アークテリクス"],
+    "rick owens": ["rickowens", "drkshdw", "リックオウエンス", "릭 오웬스"],
+    "evisu": ["エヴィス", "エビス"],
+    "saint laurent": ["ysl", "yves saint laurent", "saintlaurent", "サンローラン"],
+    "neighborhood": ["nbhd", "ネイバーフッド"],
+    "dior": ["christian dior", "ディオール", "디올"],
+    "alpha industries": ["alpha"],
+    "glory boyz": ["gloryboyz", "glo gang", "gbe"],
+    "ralph lauren": ["polo ralph lauren"],
+    "louis vuitton": ["lv", "ルイヴィトン", "루이비통"],
+    "phillipp plein": ["philipp plein", "philip plein", "plein"],
+    "mastermind": ["mastermind japan", "mastermind world", "マスターマインド"],
+    "alexander mqueen": ["alexander mcqueen", "mcqueen"],
+    "cav empt": ["cavempt", "cav empt", "c.e", "c.e.", "c.e cavempt", "シーイー", "キャブエンプト"],
+    "billionaire boys club": ["bbc", "bbc ice cream", "bbc icecream", "bbcicecream", "icecream", "ビリオネアボーイズクラブ", "ビリオネア・ボーイズ・クラブ"],
+    "vivienne westwood": ["vivienne", "ヴィヴィアン"],
+    "issey miyake": ["issey", "イッセイミヤケ"],
+    "if six was nine": ["ifsixwasnine", "if six was9", "ifsixwas9"],
+    "cp company": ["c.p. company", "c.p company", "c.p.company", "cpcompany", "cp.company", "シーピーカンパニー"],
+    "laoboutin": ["louboutin", "christian louboutin", "ルブタン"],
+    "robin jeans": ["robin's jeans", "robins jeans"],
+    "гоша рубчинский": ["gosha rubchinskiy", "gosha rubchinsky", "gosha rubchinskiy", "ゴーシャラブチンスキー"],
+    "ferragamo": ["salvatore ferragamo"],
+    "marcelo burlon": ["marcelo burlon county of milan", "county of milan"],
+    "erd": ["enfants riches deprimes", "enfants riches déprimés"],
+    "chrome hearts": ["クロムハーツ", "크롬하츠"],
+    "mihara yasuhiro": ["maison mihara yasuhiro", "mmy"],
+    "carol cristian poell": ["carol christian poell", "ccp"],
+    "maison martin margiela": ["maison margiela", "martin margiela", "margiela", "마르지엘라"],
+    "moncler": ["モンクレール", "몽클레어"],
+    "dsquared2": ["dsquared", "d squared2", "d squared"],
+}
+
+BRAND_ALIASES["hysteric glamour"] = [
+    *BRAND_ALIASES.get("hysteric glamour", []),
+    "hysteric glamor",
+    "thee hysteric xxx",
+    "\u30d2\u30b9\u30c6\u30ea\u30c3\u30af\u30b0\u30e9\u30de\u30fc",
+    "\u30d2\u30b9\u30c6\u30ea\u30c3\u30af",
+    "\u30d2\u30b9\u30ac\u30fc\u30eb",
+    "\ud788\uc2a4\ud14c\ub9ad\uae00\ub798\uba38",
+    "\ud788\uc2a4\ud14c\ub9ad \uae00\ub798\uba38",
+    "\ud788\uc2a4\ud14c\ub9ad",
+    "\ud788\uc2a4\uac78",
+]
+
+try:
+    MAX_BRAND_QUERY_VARIANTS = max(1, int(os.environ.get("MAX_BRAND_QUERY_VARIANTS", "8")))
+except ValueError:
+    MAX_BRAND_QUERY_VARIANTS = 8
+
+USER_AGENTS = [
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
+    "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+]
+
+def _user_state_file_path():
+    default_path = "/data/user_profiles.json" if Path("/data").exists() else "user_profiles.json"
+    raw = os.environ.get("BOT_USER_STATE_FILE", default_path)
+    path = Path(raw)
+    if path.is_absolute():
+        return path
+    return Path(__file__).resolve().parent / path
+
+
+USER_STATE_FILE = _user_state_file_path()
+_current_user_id = contextvars.ContextVar("current_user_id", default=None)
+_profiles_lock = threading.RLock()
+
+
+def _new_state():
+    return {
+    "chat_id": None,
+    "chat_ids": set(),
+    "awaiting": None,
+    "current_market": None,
+    "brands_page": 0,
+    "brands_query": "",
+    "brands_active_only": False,
+    "active_brands": set(ALL_BRANDS),
+    "custom_emoji_ids": {},
+    "active_vinted_regions": set(DEFAULT_VINTED_REGION_CODES),
+    "vinted_regions_page": 0,
+    "vinted_running": False,
+    "vinted_min": 10,
+    "vinted_max": 500,
+    "vinted_min_age_hours": 0,
+    "vinted_max_age_hours": MAX_AGE_HOURS,
+    "vinted_keywords": [],
+    "vinted_interval": 300,
+    "vinted_run_id": 0,
+    "vinted_seen": set(),
+    "vinted_stats": {"found": 0, "cycles": 0},
+    "_vinted_ts_field": None,
+    "_vinted_debug_done": False,
+    "mercari_running": False,
+    "mercari_min": 1000,
+    "mercari_max": 50000,
+    "mercari_min_age_hours": 0,
+    "mercari_max_age_hours": MAX_AGE_HOURS,
+    "mercari_keywords": [],
+    "mercari_interval": 300,
+    "mercari_run_id": 0,
+    "mercari_seen": set(),
+    "mercari_stats": {"found": 0, "cycles": 0},
+    "fruits_running": False,
+    "fruits_min": 10000,
+    "fruits_max": 1000000,
+    "fruits_min_age_hours": 0,
+    "fruits_max_age_hours": MAX_AGE_HOURS,
+    "fruits_keywords": [],
+    "fruits_interval": 300,
+    "fruits_run_id": 0,
+    "fruits_seen": set(),
+    "fruits_stats": {"found": 0, "cycles": 0},
+    "grailed_running": False,
+    "grailed_min": 10,
+    "grailed_max": 500,
+    "grailed_min_age_hours": 0,
+    "grailed_max_age_hours": MAX_AGE_HOURS,
+    "grailed_keywords": [],
+    "grailed_interval": 300,
+    "grailed_run_id": 0,
+    "grailed_seen": set(),
+    "grailed_stats": {"found": 0, "cycles": 0},
+    }
+
+
+_default_state = _new_state()
+_user_states = {}
+
+
+_PERSISTED_KEYS = {
+    "chat_id",
+    "chat_ids",
+    "current_market",
+    "brands_page",
+    "brands_query",
+    "brands_active_only",
+    "active_brands",
+    "custom_emoji_ids",
+    "active_vinted_regions",
+    "vinted_regions_page",
+    "vinted_min",
+    "vinted_max",
+    "vinted_min_age_hours",
+    "vinted_max_age_hours",
+    "vinted_keywords",
+    "vinted_seen",
+    "mercari_min",
+    "mercari_max",
+    "mercari_min_age_hours",
+    "mercari_max_age_hours",
+    "mercari_keywords",
+    "mercari_seen",
+    "fruits_min",
+    "fruits_max",
+    "fruits_min_age_hours",
+    "fruits_max_age_hours",
+    "fruits_keywords",
+    "fruits_seen",
+    "grailed_min",
+    "grailed_max",
+    "grailed_min_age_hours",
+    "grailed_max_age_hours",
+    "grailed_keywords",
+    "grailed_seen",
+}
+
+
+def _serialize_value(value):
+    if isinstance(value, set):
+        return sorted(str(item) for item in value if item is not None)
+    return copy.deepcopy(value)
+
+
+def _apply_saved_state(target, saved):
+    if not isinstance(saved, dict):
+        return
+    for key in _PERSISTED_KEYS:
+        if key not in saved:
+            continue
+        value = saved[key]
+        if key == "chat_ids":
+            converted = set()
+            for item in value or []:
+                try:
+                    converted.add(int(item))
+                except (TypeError, ValueError):
+                    continue
+            value = converted
+        elif key in ("active_brands", "active_vinted_regions"):
+            value = set(value or [])
+            if key == "active_brands":
+                value = {brand for brand in value if brand in ALL_BRANDS}
+                if not value:
+                    value = set(ALL_BRANDS)
+        elif key in ("vinted_seen", "mercari_seen", "fruits_seen", "grailed_seen"):
+            value = set(str(item) for item in (value or []) if item is not None)
+        if key == "active_vinted_regions":
+            value = set(DEFAULT_VINTED_REGION_CODES)
+        target[key] = value
+
+
+def _load_user_states():
+    if not USER_STATE_FILE.exists():
+        return
+    try:
+        raw = json.loads(USER_STATE_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        logging.getLogger("parser").warning("Could not read user profiles %s: %s", USER_STATE_FILE, exc)
+        return
+    if not isinstance(raw, dict):
+        return
+    with _profiles_lock:
+        for user_id, saved in raw.items():
+            profile = _new_state()
+            _apply_saved_state(profile, saved)
+            _user_states[str(user_id)] = profile
+
+
+def _save_user_states():
+    with _profiles_lock:
+        data = {
+            user_id: {
+                key: _serialize_value(profile.get(key))
+                for key in _PERSISTED_KEYS
+                if key in profile
+            }
+            for user_id, profile in _user_states.items()
+        }
+    try:
+        USER_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        USER_STATE_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError as exc:
+        logging.getLogger("parser").warning("Could not save user profiles %s: %s", USER_STATE_FILE, exc)
+
+
+def _get_profile(user_id):
+    key = str(user_id)
+    with _profiles_lock:
+        if key not in _user_states:
+            _user_states[key] = _new_state()
+        return _user_states[key]
+
+
+def set_current_user(user_id, chat_id=None):
+    if user_id is None:
+        return None
+    try:
+        user_id = int(user_id)
+    except (TypeError, ValueError):
+        return None
+    _current_user_id.set(str(user_id))
+    profile = _get_profile(user_id)
+    if chat_id is not None:
+        register_chat_id(chat_id)
+    return profile
+
+
+def save_current_user_state():
+    if _current_user_id.get() is not None:
+        _save_user_states()
+
+
+def current_user_id():
+    return _current_user_id.get()
+
+
+def _active_state():
+    user_id = _current_user_id.get()
+    if user_id is None:
+        return _default_state
+    return _get_profile(user_id)
+
+
+class StateProxy(MutableMapping):
+    def __getitem__(self, key):
+        return _active_state()[key]
+
+    def __setitem__(self, key, value):
+        _active_state()[key] = value
+
+    def __delitem__(self, key):
+        del _active_state()[key]
+
+    def __iter__(self):
+        return iter(_active_state())
+
+    def __len__(self):
+        return len(_active_state())
+
+    def __contains__(self, key):
+        return key in _active_state()
+
+    def get(self, key, default=None):
+        return _active_state().get(key, default)
+
+    def setdefault(self, key, default=None):
+        return _active_state().setdefault(key, default)
+
+    def update(self, *args, **kwargs):
+        return _active_state().update(*args, **kwargs)
+
+
+state = StateProxy()
+_load_user_states()
+
+log = logging.getLogger("parser")
+MSK_TZ = timezone(timedelta(hours=3), "MSK")
+_eur_rate_cache = {"rate": None, "ts": 0}
+_fx_rate_cache = {}
+_telegram_loop = None
+_request_throttle_lock = threading.Lock()
+_request_throttle_next_at = {}
+
+
+def set_telegram_loop(loop):
+    global _telegram_loop
+    _telegram_loop = loop
+
+
+def run_telegram_coroutine(coro, timeout=60):
+    loop = _telegram_loop
+    if loop is None or loop.is_closed():
+        coro.close()
+        log.warning("Telegram send skipped: main event loop is not available")
+        return False
+    try:
+        future = asyncio.run_coroutine_threadsafe(coro, loop)
+        future.result(timeout=timeout)
+        return True
+    except concurrent.futures.TimeoutError:
+        log.warning("Telegram send timed out after %ss", timeout)
+    except Exception as e:
+        log.warning("Telegram send failed on main event loop: %s", e)
+    return False
+
+
+def throttle_request(key, min_interval):
+    key = str(key or "default")
+    try:
+        min_interval = max(0.0, float(min_interval))
+    except (TypeError, ValueError):
+        min_interval = 0.0
+    if min_interval <= 0:
+        return
+
+    now = time.time()
+    with _request_throttle_lock:
+        next_at = _request_throttle_next_at.get(key, 0.0)
+        wait = max(0.0, next_at - now)
+        _request_throttle_next_at[key] = max(now, next_at) + min_interval
+    if wait > 0:
+        time.sleep(wait)
+
+
+def register_chat_id(chat_id):
+    if chat_id is None:
+        return
+    try:
+        chat_id = int(chat_id)
+    except (TypeError, ValueError):
+        return
+    state["chat_id"] = chat_id
+    state.setdefault("chat_ids", set()).add(chat_id)
+
+
+def notification_chat_ids():
+    ids = set(state.get("chat_ids") or [])
+    if state.get("chat_id") is not None:
+        ids.add(state["chat_id"])
+    return sorted(ids)
+
+
+def is_market_run_current(market, run_id):
+    return bool(
+        state.get(f"{market}_running")
+        and run_id is not None
+        and state.get(f"{market}_run_id", 0) == run_id
+    )
+
+
+def sleep_while_market_running(market, run_id, seconds):
+    end = time.time() + float(seconds)
+    while is_market_run_current(market, run_id) and time.time() < end:
+        time.sleep(min(1.0, end - time.time()))
+
+
+def _seen_key(item_id, namespace=None):
+    item_id = str(item_id or "").strip()
+    if not item_id:
+        return ""
+    namespace = str(namespace or "").strip()
+    return f"{namespace}:{item_id}" if namespace else item_id
+
+
+def _seen_keys(item_id, namespace=None, fingerprints=None):
+    keys = []
+    legacy = str(item_id or "").strip()
+    namespaced = _seen_key(legacy, namespace)
+    if namespaced:
+        keys.append(namespaced)
+    if legacy:
+        keys.append(legacy)
+    for fingerprint in fingerprints or []:
+        fingerprint = str(fingerprint or "").strip()
+        if fingerprint:
+            keys.append(fingerprint)
+    return _dedupe_texts(keys)
+
+
+def _fingerprint_part(value):
+    value = normalize_match_text(value)
+    value = re.sub(r"https?://\S+", " ", value)
+    value = re.sub(r"\b\d+(?:[.,]\d+)?\s*(?:eur|euro|usd|jpy|krw|pln|gbp|ВҐ|в‚©|в‚¬|\$)\b", " ", value)
+    value = re.sub(r"[^0-9a-zР°-СЏС‘к°Ђ-нћЈгЃЃ-г‚“г‚Ў-гѓідёЂ-йѕҐ]+", " ", value)
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def listing_fingerprint(*parts, prefix="fp"):
+    normalized = [_fingerprint_part(part) for part in parts if _fingerprint_part(part)]
+    if not normalized:
+        return ""
+    material = "|".join(normalized)
+    if len(material) < 6:
+        return ""
+    digest = hashlib.sha1(material.encode("utf-8", errors="ignore")).hexdigest()[:24]
+    return f"{prefix}:{digest}"
+
+
+def mark_item_seen(market, item_id, namespace=None, max_items=10000, fingerprints=None):
+    keys = _seen_keys(item_id, namespace, fingerprints)
+    if not keys:
+        return False
+
+    seen_key = f"{market}_seen"
+
+    with _profiles_lock:
+        profile = _active_state()
+        seen = profile.setdefault(seen_key, set())
+        if not isinstance(seen, set):
+            seen = set(str(item) for item in (seen or []) if item is not None)
+            profile[seen_key] = seen
+
+        if any(key in seen for key in keys):
+            return False
+
+        seen.update(keys)
+        if len(seen) > max_items:
+            keep = list(seen)[-max_items:]
+            profile[seen_key] = set(keep)
+
+    save_current_user_state()
+    return True
+
+
+def has_item_seen(market, item_id, namespace=None, fingerprints=None):
+    keys = _seen_keys(item_id, namespace, fingerprints)
+    if not keys:
+        return False
+    seen = state.get(f"{market}_seen") or set()
+    return any(key in seen for key in keys)
+
+
+def download_image_bytes(url, referer=None, timeout=15):
+    if not url:
+        return None
+    url = str(url).strip()
+    if url.startswith("//"):
+        url = f"https:{url}"
+    if not (url.startswith("http://") or url.startswith("https://")):
+        return None
+
+    try:
+        response = requests.get(
+            url,
+            headers={
+                "User-Agent": USER_AGENTS[int(time.time()) % len(USER_AGENTS)],
+                "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+                **({"Referer": referer} if referer else {}),
+            },
+            timeout=timeout,
+            allow_redirects=True,
+        )
+        if response.status_code != 200:
+            log.warning("Image download bad status %s url=%s", response.status_code, url)
+            return None
+
+        content = response.content or b""
+        content_type = (response.headers.get("content-type") or "").lower()
+        looks_like_image = content.startswith((b"\xff\xd8", b"\x89PNG", b"GIF8", b"RIFF"))
+        if not content_type.startswith("image/") and not looks_like_image:
+            log.warning("Image download wrong content-type %s url=%s", content_type, url)
+            return None
+        if len(content) < 1000:
+            log.warning("Image download too small url=%s size=%s", url, len(content))
+            return None
+        return content
+    except Exception as e:
+        log.warning("Image download failed: %s url=%s", e, url)
+        return None
+
+
+def get_jpy_to_eur() -> float:
+    now = time.time()
+    if _eur_rate_cache["rate"] and now - _eur_rate_cache["ts"] < 3600:
+        return _eur_rate_cache["rate"]
+    try:
+        r = requests.get("https://api.frankfurter.app/latest?from=JPY&to=EUR", timeout=10)
+        rate = float(r.json()["rates"]["EUR"])
+        _eur_rate_cache["rate"] = rate
+        _eur_rate_cache["ts"] = now
+        log.info("Курс JPY->EUR обновлен: %.5f", rate)
+        return rate
+    except Exception as e:
+        log.warning("Не удалось получить курс JPY->EUR: %s", e)
+        return 0.0062
+
+
+def get_fx_rate(from_currency: str, to_currency: str) -> float:
+    src = from_currency.upper()
+    dst = to_currency.upper()
+    if src == dst:
+        return 1.0
+    key = (src, dst)
+    now = time.time()
+    cached = _fx_rate_cache.get(key)
+    if cached and now - cached["ts"] < 6 * 3600:
+        return cached["rate"]
+    fallback = {("EUR", "PLN"): 4.23, ("PLN", "EUR"): 1 / 4.23}.get(key, 1.0)
+    try:
+        r = requests.get(
+            "https://api.frankfurter.app/latest",
+            params={"from": src, "to": dst},
+            timeout=10,
+        )
+        rate = float(r.json()["rates"][dst])
+        _fx_rate_cache[key] = {"rate": rate, "ts": now}
+        return rate
+    except Exception as e:
+        log.warning("Не удалось получить курс %s->%s: %s", src, dst, e)
+        return fallback
+
+
+def vinted_domain_currency(domain: str) -> str:
+    return "PLN" if domain.endswith(".pl") else "EUR"
+
+
+def vinted_price_bounds(domain: str) -> tuple[float, float, str]:
+    currency = vinted_domain_currency(domain)
+    rate = get_fx_rate("EUR", currency)
+    return state["vinted_min"] * rate, state["vinted_max"] * rate, currency
+
+
+def vinted_price_to_eur(price: float, currency: str) -> float:
+    return float(price) * get_fx_rate(currency or "EUR", "EUR")
+
+
+def _try_parse_ts(val) -> float | None:
+    if val is None:
+        return None
+    if isinstance(val, datetime):
+        dt = val if val.tzinfo else val.replace(tzinfo=timezone.utc)
+        return dt.timestamp()
+    if hasattr(val, "seconds"):
+        try:
+            return _try_parse_ts(float(val.seconds))
+        except (TypeError, ValueError):
+            pass
+    if hasattr(val, "timestamp") and callable(val.timestamp):
+        try:
+            return _try_parse_ts(float(val.timestamp()))
+        except (TypeError, ValueError, OSError):
+            pass
+    if isinstance(val, (int, float)):
+        ts = float(val)
+        if 1577836800000 < ts < 1893456000000:
+            ts /= 1000
+        return ts if 1577836800 < ts < 1893456000 else None
+    if isinstance(val, str):
+        val = val.strip()
+        if not val:
+            return None
+        try:
+            return _try_parse_ts(float(val))
+        except ValueError:
+            pass
+        try:
+            v = val.replace(" UTC", "+00:00").replace("Z", "+00:00").replace(" ", "T")
+            dt = datetime.fromisoformat(v)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.timestamp()
+        except Exception:
+            pass
+        for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+            try:
+                return datetime.strptime(val[:19], fmt).replace(tzinfo=timezone.utc).timestamp()
+            except Exception:
+                pass
+    return None
+
+
+def sort_items_newest(items, timestamp_getter=None):
+    def item_ts(item):
+        try:
+            value = timestamp_getter(item) if timestamp_getter else None
+        except Exception:
+            value = None
+        if value is None and isinstance(item, dict):
+            for key in (
+                "created_at",
+                "createdAt",
+                "created_at_i",
+                "created_at_ts",
+                "activation_ts",
+                "updated_at",
+                "updated_at_ts",
+                "listed_at",
+                "listedAt",
+                "bumped_at",
+            ):
+                if key in item:
+                    value = item.get(key)
+                    break
+        return _try_parse_ts(value) or 0
+
+    return sorted(list(items or []), key=item_ts, reverse=True)
+
+
+def format_msk_timestamp(ts) -> str:
+    parsed = _try_parse_ts(ts)
+    if not parsed:
+        return "не указано"
+    return datetime.fromtimestamp(parsed, tz=timezone.utc).astimezone(MSK_TZ).strftime("%d-%m-%Y в %H:%M МСК")
+
+
+def _age_label(hours):
+    hours = float(hours)
+    return f"{int(hours)}ч" if hours == int(hours) else f"{hours:g}ч"
+
+
+def age_range_label(min_hours, max_hours):
+    min_hours = float(min_hours or 0)
+    max_hours = float(max_hours or 0)
+    if min_hours <= 0:
+        return f"до {_age_label(max_hours)}"
+    return f"{_age_label(min_hours)}–{_age_label(max_hours)}"
+
+
+def _eur_label(value):
+    return f"{float(value):g}"
+
+
+def vinted_price_range_label():
+    return f"{_eur_label(state['vinted_min'])}–{_eur_label(state['vinted_max'])}€"
+
+
+def mercari_price_range_label():
+    return f"{int(state['mercari_min']):,}–{int(state['mercari_max']):,}¥"
+
+
+def fruits_price_range_label():
+    return f"{int(state['fruits_min']):,}–{int(state['fruits_max']):,}₩"
+
+
+def grailed_price_range_label():
+    return f"${_eur_label(state['grailed_min'])}–${_eur_label(state['grailed_max'])}"
+
+
+def parse_keywords(text):
+    raw = str(text or "").strip()
+    if raw.lower() in ("", "-", "нет", "none", "clear", "off", "выкл"):
+        return []
+    parts = re.split(r"[,;\n]+", raw)
+    result = []
+    seen = set()
+    for part in parts:
+        keyword = re.sub(r"\s+", " ", part).strip()
+        if not keyword:
+            continue
+        key = keyword.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(keyword)
+    return result[:20]
+
+
+def keywords_label(market):
+    keywords = state.get(f"{market}_keywords", [])
+    if not keywords:
+        return "только бренд"
+    text = ", ".join(keywords)
+    return text if len(text) <= 90 else text[:87] + "..."
+
+
+def _dedupe_texts(values):
+    result = []
+    seen = set()
+    for value in values:
+        text = re.sub(r"\s+", " ", str(value or "")).strip()
+        if not text:
+            continue
+        key = text.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(text)
+    return result
+
+
+def normalize_match_text(value):
+    """Normalize text for brand/keyword matching across JP/KR/Latin listings.
+
+    One normalization layer is used for every brand in ALL_BRANDS.  It fixes
+    full-width forms, unicode dashes (Y−3), punctuation, slashes/dots and
+    excessive whitespace before any brand comparison is made.
+    """
+    value = unicodedata.normalize("NFKC", str(value or "")).lower()
+    value = value.replace("＆", "&")
+    value = value.replace("’", "'").replace("`", "'").replace("´", "'")
+    value = re.sub(r"[‐‑‒–—―−﹣－]+", "-", value)
+    value = re.sub(r"[\u200b\u200c\u200d\ufeff]", "", value)
+    value = re.sub(r"\s*&\s*", "&", value)
+    value = re.sub(r"[\s_./\\]+", " ", value)
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def compact_match_text(value):
+    value = normalize_match_text(value)
+    return re.sub(r"[^0-9a-zа-яё가-힣ぁ-んァ-ン一-龥]+", "", value)
+
+
+def _ascii_fold(value):
+    value = unicodedata.normalize("NFKD", str(value or ""))
+    return "".join(ch for ch in value if not unicodedata.combining(ch))
+
+
+def _auto_brand_aliases(brand):
+    """Generate safe aliases for every brand from ALL_BRANDS.
+
+    Manual BRAND_ALIASES still win, but this guarantees each brand also gets
+    punctuation/space/slash/ampersand variants without adding one-off patches.
+    Examples: Project G/R -> project gr/projectgr, Dolce&Gabbana -> dolce gabbana,
+    CP Company -> cpcompany, Y-3 -> y3, If Six Was Nine -> ifsixwasnine.
+    """
+    raw = str(brand or "").strip()
+    norm = normalize_match_text(raw)
+    if not norm:
+        return []
+
+    variants = [norm]
+    folded = normalize_match_text(_ascii_fold(norm))
+    if folded != norm:
+        variants.append(folded)
+
+    # Punctuation and conjunction variants.
+    for base in list(variants):
+        if "&" in base:
+            variants.extend([base.replace("&", " and "), base.replace("&", " ")])
+        if " and " in base:
+            variants.append(base.replace(" and ", " & "))
+        variants.append(re.sub(r"[./\\]+", " ", base))
+        variants.append(re.sub(r"[-]+", " ", base))
+        variants.append(re.sub(r"[\s./\\-]+", "", base))
+
+    compact = compact_match_text(norm)
+    if compact:
+        variants.append(compact)
+
+    # Common short form for two/three word Latin brands: Stone Island -> si is
+    # intentionally NOT added because it is too broad. Only compact full-name is used.
+    return _dedupe_texts(variants)
+
+
+def _term_variants(term):
+    term = normalize_match_text(term)
+    if not term:
+        return []
+    variants = [term]
+    compact = compact_match_text(term)
+    if compact and compact != term:
+        variants.append(compact)
+    if "&" in term:
+        variants.append(term.replace("&", " and "))
+        variants.append(term.replace("&", " "))
+    if " and " in term:
+        variants.append(term.replace(" and ", " & "))
+    variants.append(re.sub(r"[-]+", " ", term))
+    variants.append(re.sub(r"[./\\]+", " ", term))
+    return _dedupe_texts(variants)
+
+
+def brand_aliases(brand):
+    key = normalize_match_text(brand)
+    aliases = []
+    # BRAND_ALIASES keys may contain slashes/dots/old spelling; normalize them
+    # too, otherwise entries like project g/r would never be used.
+    for alias_key, alias_values in BRAND_ALIASES.items():
+        if normalize_match_text(alias_key) == key:
+            aliases.extend(alias_values)
+    aliases.extend(_auto_brand_aliases(key))
+    # Do not return the exact canonical brand as an alias; caller adds it.
+    return _dedupe_texts(a for a in aliases if normalize_match_text(a) != key)
+
+
+def brand_query_variants(brand):
+    # Used for marketplace search. Every brand gets automatic compact/punctuation
+    # variants, capped by MAX_BRAND_QUERY_VARIANTS to avoid request explosions.
+    return _dedupe_texts([brand, *brand_aliases(brand)])[:MAX_BRAND_QUERY_VARIANTS]
+
+
+def brand_match_terms(brand):
+    terms = []
+    for value in [brand, *brand_aliases(brand)]:
+        terms.extend(_term_variants(value))
+    return _dedupe_texts(terms)
+
+
+def text_matches_brand(text, brand, *, extra_terms=None, exclude_compact_terms=None):
+    normalized_text = normalize_match_text(text)
+    excluded = {compact_match_text(x) for x in (exclude_compact_terms or []) if x}
+    terms = [*brand_match_terms(brand), *(extra_terms or [])]
+    for term in terms:
+        norm = normalize_match_text(term)
+        comp = compact_match_text(term)
+        if not norm:
+            continue
+        if comp in excluded:
+            continue
+        if _contains_term(normalized_text, norm):
+            return True
+        # Compact matching fixes Y-3/Y−3/Y3, Project G/R/ProjectGR, etc.
+        # Avoid ultra-short generic terms unless they came from an explicit alias.
+        if comp and len(comp) >= 2 and _contains_compact_term(normalized_text, comp):
+            return True
+    return False
+
+
+def has_brand_disclaimer(text, brand):
+    text = re.sub(r"\s+", " ", str(text or "").lower()).strip()
+    if not text:
+        return False
+
+    markers_after_brand = (
+        r"style",
+        r"inspired",
+        r"inspiration",
+        r"look\s*alike",
+        r"lookalike",
+        r"dupe",
+        r"replica",
+        r"fake",
+        r"bootleg",
+        r"unbranded",
+        r"w\s+stylu",
+        r"в\s+стиле",
+    )
+    marker_alt = "|".join(markers_after_brand)
+
+    for term in brand_match_terms(brand):
+        term = re.sub(r"\s+", " ", str(term or "").lower()).strip()
+        if not term:
+            continue
+        escaped = re.escape(term).replace(r"\ ", r"\s+")
+        if re.search(rf"(?<![a-z0-9]){escaped}[-\s]+(?:{marker_alt})(?![a-z0-9])", text):
+            return True
+        if re.search(rf"(?<![a-z0-9])(?:inspired\s+by|в\s+стиле|w\s+stylu)[-\s]+{escaped}(?![a-z0-9])", text):
+            return True
+
+    return False
+
+
+def _keyword_contains_brand(keyword, brand):
+    return text_matches_brand(keyword, brand)
+
+
+def _keyword_mentions_other_brand(keyword, brand):
+    return any(
+        other != brand and _keyword_contains_brand(keyword, other)
+        for other in ALL_BRANDS
+    )
+
+
+def _keyword_without_brand(keyword, brand):
+    result = str(keyword or "").strip()
+    if not result:
+        return result
+    for brand_text in sorted(brand_match_terms(brand), key=len, reverse=True):
+        pattern = re.escape(brand_text).replace(r"\ ", r"\s+")
+        result = re.sub(pattern, " ", result, flags=re.IGNORECASE)
+    return re.sub(r"\s+", " ", result).strip(" ,;:-")
+
+
+def market_search_queries(brand, market):
+    keywords = state.get(f"{market}_keywords", [])
+    if not keywords:
+        return [(query_brand, "") for query_brand in brand_query_variants(brand)]
+    queries = []
+    for keyword in keywords:
+        keyword = re.sub(r"\s+", " ", str(keyword or "").strip())
+        if not keyword:
+            continue
+        if _keyword_mentions_other_brand(keyword, brand):
+            continue
+        match_keyword = _keyword_without_brand(keyword, brand)
+        if _keyword_contains_brand(keyword, brand):
+            queries.append((keyword, match_keyword))
+            normalized_match = _normalize_keyword_text(match_keyword)
+            if normalized_match and normalized_match != match_keyword.lower():
+                queries.append((f"{brand} {normalized_match}", normalized_match))
+            continue
+        for query_brand in brand_query_variants(brand):
+            queries.append((f"{query_brand} {keyword}", keyword))
+            normalized_keyword = _normalize_keyword_text(keyword)
+            if normalized_keyword and normalized_keyword != keyword.lower():
+                queries.append((f"{query_brand} {normalized_keyword}", normalized_keyword))
+    result = []
+    seen = set()
+    for query, match_keyword in queries:
+        key = (query.lower().strip(), match_keyword.lower().strip())
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append((query, match_keyword))
+    return result
+
+
+def parse_age_range(text):
+    nums = [n.replace(",", ".") for n in re.findall(r"\d+(?:[.,]\d+)?", text or "")]
+    if not nums:
+        raise ValueError
+    if len(nums) == 1:
+        min_hours = 0.0
+        max_hours = float(nums[0])
+    else:
+        min_hours = float(nums[0])
+        max_hours = float(nums[1])
+    if min_hours < 0 or max_hours <= 0 or min_hours >= max_hours:
+        raise ValueError
+    return min_hours, max_hours
+
+
+def _parse_price_number(raw):
+    s = re.sub(r"[^\d,.\s]", "", str(raw or "")).replace(" ", "")
+    if not s:
+        raise ValueError
+    if "," in s and "." in s:
+        if s.rfind(",") > s.rfind("."):
+            s = s.replace(".", "").replace(",", ".")
+        else:
+            s = s.replace(",", "")
+    elif "," in s:
+        chunks = s.split(",")
+        if len(chunks) > 1 and len(chunks[0]) <= 3 and all(len(c) == 3 for c in chunks[1:]):
+            s = "".join(chunks)
+        else:
+            s = s.replace(",", ".")
+    elif "." in s:
+        chunks = s.split(".")
+        if len(chunks) > 1 and len(chunks[0]) <= 3 and all(len(c) == 3 for c in chunks[1:]):
+            s = "".join(chunks)
+    return float(s)
+
+
+def parse_price_range(text, *, is_int=False):
+    raw = str(text or "").strip()
+    parts = [p for p in re.split(r"\s*(?:-|–|—|до|to)\s*", raw, maxsplit=1, flags=re.IGNORECASE) if p.strip()]
+    if len(parts) < 2:
+        parts = re.findall(r"\d+(?:[.,]\d+)?", raw)
+    if len(parts) < 2:
+        raise ValueError
+    min_price = _parse_price_number(parts[0])
+    max_price = _parse_price_number(parts[1])
+    if min_price <= 0 or max_price <= 0 or min_price >= max_price:
+        raise ValueError
+    if is_int:
+        return int(min_price), int(max_price)
+    return min_price, max_price
+
+
+def publish_age_hours(ts):
+    parsed = _try_parse_ts(ts)
+    if not parsed:
+        return None
+    return (time.time() - parsed) / 3600
+
+
+def age_in_range(ts, min_hours, max_hours):
+    age = publish_age_hours(ts)
+    if age is None:
+        return None
+    if age < -1:
+        return False
+    return float(min_hours) <= age <= float(max_hours)
+
+
+def translate_to_ru(text: str) -> str:
+    if not text or not text.strip():
+        return text
+    cyr = sum(1 for c in text if "\u0400" <= c <= "\u04FF")
+    if cyr / max(len(text), 1) > 0.4:
+        return text
+    try:
+        r = requests.get(
+            "https://translate.googleapis.com/translate_a/single",
+            params={"client": "gtx", "sl": "auto", "tl": "ru", "dt": "t", "q": text},
+            timeout=8,
+        )
+        data = r.json()
+        return "".join(part[0] for part in data[0] if part[0]).strip() or text
+    except Exception:
+        return text
+
+
+def _obj_get(obj, *names, default=None):
+    for name in names:
+        if isinstance(obj, dict) and name in obj:
+            return obj[name]
+        if hasattr(obj, name):
+            return getattr(obj, name)
+    return default
+
+
+def _contains_term(text, term):
+    text = normalize_match_text(text)
+    term = normalize_match_text(term)
+    if not term:
+        return False
+    if re.fullmatch(r"[a-z0-9][a-z0-9 .&'/-]*[a-z0-9]", term):
+        if _contains_compact_term(text, compact_match_text(term)):
+            return True
+    elif term in text:
+        return True
+    compact_term = compact_match_text(term)
+    if compact_term and len(compact_term) >= 3:
+        return _contains_compact_term(text, compact_term)
+    return False
+
+
+def _contains_compact_term(text, compact_term):
+    compact_term = compact_match_text(compact_term)
+    if not compact_term:
+        return False
+
+    text = normalize_match_text(text)
+    if not text:
+        return False
+
+    if re.fullmatch(r"[a-z0-9]+", compact_term):
+        separator = r"[\s._/\\&'-]*"
+        body = separator.join(re.escape(ch) for ch in compact_term)
+        if len(compact_term) <= 3:
+            code_suffix = r"\s*[-._/\\&']+\s*[a-z0-9]"
+            pattern = rf"(?<![a-z0-9]){body}(?!{code_suffix})(?![a-z0-9])"
+        else:
+            pattern = rf"(?<![a-z0-9]){body}(?![a-z0-9])"
+        return re.search(pattern, text) is not None
+
+    if len(compact_term) >= 3:
+        return compact_term in compact_match_text(text)
+    return False
+
+
+def _has_any_term(text, terms):
+    return any(_contains_term(text, term) for term in terms)
+
+
+def fashion_kind_from_text(text):
+    text = normalize_match_text(text)
+    if not text:
+        return ""
+    for kind, terms in COMMON_FASHION_KIND_GROUPS:
+        if _has_any_term(text, terms):
+            return kind
+    if DEEP_FASHION_SIZE_PATTERN.search(text):
+        return "clothing"
+    return ""
+
+
+def has_fashion_item_signal(text):
+    text = normalize_match_text(text)
+    if not text:
+        return False
+    return _has_any_term(text, COMMON_FASHION_KIND_WORDS)
+
+
+def has_fashion_signal(text):
+    return bool(fashion_kind_from_text(text))
+
+
+def _has_counterfeit_noise(text):
+    if _has_any_term(text, COUNTERFEIT_SAFE_MODEL_TERMS):
+        return False
+    return _has_any_term(text, COUNTERFEIT_NOISE_TERMS)
+
+
+def is_non_fashion_noise_text(text):
+    text = normalize_match_text(text)
+    if not text:
+        return False
+    if _has_counterfeit_noise(text):
+        return True
+    if _has_any_term(text, NON_FASHION_NOISE_TERMS):
+        return not has_fashion_item_signal(text)
+    if _has_any_term(text, DEEP_FASHION_BLOCKED_WORDS):
+        return not has_fashion_item_signal(text)
+    return False
+
+
+def is_unwanted_item_text(text):
+    return _has_any_term(str(text or "").lower(), UNWANTED_ITEM_TERMS)
+
+
+KEYWORD_ALIASES = {
+    "track": [
+        "\u30c8\u30e9\u30c3\u30af",
+        "\u30c8\u30e9\u30c3\u30af\u30b9\u30cb\u30fc\u30ab\u30fc",
+        "\u30c8\u30e9\u30c3\u30af\u30b7\u30e5\u30fc\u30ba",
+        "\u30c8\u30e9\u30c3\u30af\u30c8\u30ec\u30fc\u30ca\u30fc",
+        "\u30c8\u30e9\u30c3\u30af1",
+        "\u30c8\u30e9\u30c3\u30af2",
+    ],
+    "sneaker": ["sneakers", "\u30b9\u30cb\u30fc\u30ab\u30fc", "\u30b7\u30e5\u30fc\u30ba"],
+    "sneakers": ["sneaker", "\u30b9\u30cb\u30fc\u30ab\u30fc", "\u30b7\u30e5\u30fc\u30ba"],
+    "shoe": ["shoes", "\u30b7\u30e5\u30fc\u30ba", "\u9774"],
+    "shoes": ["shoe", "\u30b7\u30e5\u30fc\u30ba", "\u9774"],
+    "zip hoodie": ["zip-up hoodie", "zip up hoodie", "hoodie zip", "hoodie zip-up", "hooded zip", "후드집업", "집업 후드"],
+    "zip-hoodie": ["zip hoodie", "zip-up hoodie", "zip up hoodie", "hoodie zip", "hoodie zip-up", "hooded zip", "후드집업", "집업 후드"],
+    "zip up hoodie": ["zip hoodie", "zip-up hoodie", "hoodie zip", "hoodie zip-up", "hooded zip", "후드집업", "집업 후드"],
+    "hoodie": ["hooded", "hood", "후드", "후드티"],
+    "zip": ["zip-up", "zip up", "집업"],
+    "baggy": ["wide", "wide leg", "loose", "oversized", "배기", "와이드"],
+    "худи": ["hoodie", "hooded", "hood", "sweatshirt", "parka", "パーカー", "フーディ", "후드", "후드티"],
+    "зип худи": ["zip hoodie", "zip-up hoodie", "zip up hoodie", "hoodie zip", "hoodie zip-up", "hooded zip", "후드집업", "집업 후드"],
+    "зипка": ["zip hoodie", "zip-up hoodie", "zip up hoodie", "hoodie zip", "hoodie zip-up", "zip jacket", "후드집업", "집업"],
+    "куртка": ["jacket", "outerwear", "blouson", "bomber", "windbreaker", "coat", "ジャケット", "ブルゾン", "アウター", "자켓", "재킷", "아우터"],
+    "бомбер": ["bomber", "bomber jacket", "ボンバー", "항공점퍼", "봄버"],
+    "пуховик": ["down jacket", "puffer", "puffer jacket", "ダウン", "패딩", "다운"],
+    "джинсы": ["jeans", "denim", "pants", "ジーンズ", "デニム", "청바지", "데님"],
+    "деним": ["denim", "jeans", "デニム", "데님"],
+    "штаны": ["pants", "trousers", "bottoms", "slacks", "パンツ", "ズボン", "바지", "팬츠"],
+    "брюки": ["pants", "trousers", "slacks", "パンツ", "スラックス", "바지", "슬랙스"],
+    "карго": ["cargo", "cargo pants", "カーゴ", "카고"],
+    "бэгги": ["baggy", "wide", "wide leg", "loose", "oversized", "배기", "와이드"],
+    "широкие": ["wide", "wide leg", "baggy", "loose", "ワイド", "와이드"],
+    "футболка": ["t-shirt", "t shirt", "tee", "shirt", "カットソー", "tシャツ", "티셔츠", "반팔"],
+    "лонгслив": ["long sleeve", "longsleeve", "ls tee", "ロンt", "ロングスリーブ", "긴팔"],
+    "рубашка": ["shirt", "button up", "button-up", "シャツ", "셔츠"],
+    "свитер": ["sweater", "knit", "jumper", "ニット", "セーター", "니트", "스웨터"],
+    "кардиган": ["cardigan", "カーディガン", "가디건"],
+    "жилет": ["vest", "ベスト", "조끼", "베스트"],
+    "кроссовки": ["sneaker", "sneakers", "trainer", "trainers", "shoes", "スニーカー", "シューズ", "운동화", "스니커즈"],
+    "кеды": ["sneaker", "sneakers", "canvas shoes", "スニーカー", "운동화", "스니커즈"],
+    "ботинки": ["boots", "boot", "ブーツ", "부츠"],
+    "сумка": ["bag", "bags", "shoulder bag", "tote", "バッグ", "ショルダーバッグ", "가방", "백"],
+    "рюкзак": ["backpack", "rucksack", "リュック", "バックパック", "백팩"],
+    "шапка": ["beanie", "hat", "cap", "ニット帽", "帽子", "비니", "모자"],
+    "кепка": ["cap", "hat", "キャップ", "모자", "캡"],
+    "ремень": ["belt", "ベルト", "벨트"],
+    "шарф": ["scarf", "muffler", "マフラー", "スカーフ", "머플러", "스카프"],
+    "очки": ["glasses", "sunglasses", "eyewear", "メガネ", "眼鏡", "サングラス", "안경", "선글라스"],
+}
+
+
+def _normalize_keyword_text(value):
+    value = str(value or "").lower()
+    value = re.sub(r"[-_/]+", " ", value)
+    value = re.sub(r"[^0-9a-zа-яё가-힣ぁ-んァ-ン一-龥]+", " ", value)
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def _keyword_tokens(value):
+    return [token for token in _normalize_keyword_text(value).split() if token]
+
+
+def _contains_keyword_phrase(text, phrase):
+    phrase = str(phrase or "").lower().strip()
+    if not phrase:
+        return False
+    if _has_any_term(text, [phrase]):
+        return True
+    tokens = _keyword_tokens(phrase)
+    if not tokens:
+        return False
+    normalized_text = _normalize_keyword_text(text)
+    return all(_has_any_term(normalized_text, [token]) for token in tokens)
+
+
+def keyword_matches_text(text, keyword):
+    if not keyword:
+        return True
+    text = str(text or "").lower()
+    keyword = str(keyword or "").lower().strip()
+    normalized_keyword = _normalize_keyword_text(keyword)
+    terms = [keyword, normalized_keyword]
+    terms.extend(KEYWORD_ALIASES.get(keyword, []))
+    terms.extend(KEYWORD_ALIASES.get(normalized_keyword, []))
+    seen = set()
+    for term in terms:
+        term = str(term or "").strip()
+        if not term:
+            continue
+        key = term.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        if _contains_keyword_phrase(text, term):
+            return True
+    return False
